@@ -6,6 +6,15 @@ from datetime import datetime, timedelta, timezone
 from get_livePrices import get_price
 from get_RSI import fetch_RSI
 import time
+import os
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import load_model
+
+MODEL_FOLDER = "model"
+
 
 app = Flask(__name__)
 app.config["MONGO_URI"] = "mongodb://localhost:27017/mydatabase"
@@ -20,6 +29,100 @@ bbands_collection = mongo.db.bbands
 rsi_collection = mongo.db.rsi
 selectedtime_collection = mongo.db.timeFrame
 alerts_collection = mongo.db.alerts
+
+Z
+
+
+
+# Mapping CoinGecko identifiers correctly
+coingecko_coin_ids = {
+    "bitcoin": "bitcoin",
+    "ethereum": "ethereum",
+    "solana": "solana",
+    "binancecoin": "binancecoin",
+    "ripple": "ripple",
+    "dogecoin": "dogecoin",
+    "cardano": "cardano",
+    "matic-network": "matic",  # CoinGecko uses "matic" for Polygon
+    "polkadot": "polkadot"
+}
+
+
+# Function to fetch latest data from CoinGecko
+def fetch_coin_data(coin_symbol, days=120):
+    # Ensure correct CoinGecko identifier
+    if coin_symbol not in coingecko_coin_ids:
+        print(f"Invalid coin symbol: {coin_symbol}")
+        return None
+    
+    coingecko_id = coingecko_coin_ids[coin_symbol]
+    url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days={days}'
+    
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.json().get('prices', [])
+    else:
+        print(f"Error fetching data for {coin_symbol}: {response.status_code}")
+        return None
+
+@app.route('/')
+def home():
+    return jsonify({"message": "Crypto Price Prediction API is running!"})
+
+@app.route('/predict', methods=['GET'])
+def predict_price():
+    coin = request.args.get("coin", "").lower()
+    
+    print(f"Received coin: '{coin}'")  # Debugging output
+
+    if coin not in coingecko_coin_ids:
+        return jsonify({"error": "Invalid coin. Available options: " + ", ".join(coingecko_coin_ids.keys())}), 400
+
+    model_path = os.path.join(MODEL_FOLDER, f"{coin}_crypto_price_model.h5")
+
+    if not os.path.exists(model_path):
+        return jsonify({"error": f"No trained model found for {coin}"}), 400
+
+    # Load the trained LSTM model
+    model = load_model(model_path)
+
+    # Fetch latest 120 days of coin data
+    data = fetch_coin_data(coin, days=120)
+    if not data:
+        return jsonify({"error": f"Failed to fetch data for {coin}"}), 500
+
+    # Convert to DataFrame
+    df = pd.DataFrame(data, columns=['timestamp', 'Close'])
+    df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('Date', inplace=True)
+
+    # Preprocess the data
+    dataset = df[['Close']].values
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(dataset)
+
+    # Prepare input sequence
+    lookback = 120  # Use 4 months of historical data
+    x_input = scaled_data[-lookback:].reshape(1, lookback, 1)
+
+    # Predict next 40 days
+    future_predictions = []
+    for _ in range(40):
+        pred = model.predict(x_input)
+        future_price = scaler.inverse_transform(pred)[0][0]
+        future_predictions.append(round(future_price, 2))
+
+        # Update input sequence with new predicted value
+        pred = pred.reshape(1, 1, 1)  # Ensure pred matches LSTM input shape
+        x_input = np.append(x_input[:, 1:, :], pred, axis=1)
+
+
+    return jsonify({
+        "coin": coingecko_coin_ids[coin],
+        "predicted_prices": [float(pred) for pred in future_predictions]  # Convert float32 to Python float
+    })
+
+
 
 @app.route('/signup', methods=['POST'])
 def signup():

@@ -6,12 +6,22 @@ from datetime import datetime, timedelta, timezone
 from get_livePrices import get_price
 from get_RSI import fetch_RSI
 import time
+import yfinance as yf
 import os
-import numpy as np
+from flask_socketio import SocketIO, emit
+from threading import Thread
+import numpy as np  
 import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model
+from datetime import datetime, timedelta
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import io,base64
+
+
 
 MODEL_FOLDER = "model"
 
@@ -30,98 +40,105 @@ rsi_collection = mongo.db.rsi
 selectedtime_collection = mongo.db.timeFrame
 alerts_collection = mongo.db.alerts
 
-Z
 
-
-
-# Mapping CoinGecko identifiers correctly
-coingecko_coin_ids = {
-    "bitcoin": "bitcoin",
-    "ethereum": "ethereum",
-    "solana": "solana",
-    "binancecoin": "binancecoin",
-    "ripple": "ripple",
-    "dogecoin": "dogecoin",
-    "cardano": "cardano",
-    "matic-network": "matic",  # CoinGecko uses "matic" for Polygon
-    "polkadot": "polkadot"
+# Load pre-trained models
+model_directory = "trainedmodels"
+models = {
+    'bitcoin': load_model(os.path.join(model_directory, 'bitcoin_model.h5')),
+    'binancecoin': load_model(os.path.join(model_directory, 'binancecoin_model.h5')),
+    'ethereum': load_model(os.path.join(model_directory, 'ethereum_model.h5')),
+    'solana': load_model(os.path.join(model_directory, 'solana_model.h5'))
 }
 
+# Constants for News API
+NEWS_API_KEY = 'c01410fe218b4e299d30e04d2a6ff53c'
 
-# Function to fetch latest data from CoinGecko
-def fetch_coin_data(coin_symbol, days=120):
-    # Ensure correct CoinGecko identifier
-    if coin_symbol not in coingecko_coin_ids:
-        print(f"Invalid coin symbol: {coin_symbol}")
-        return None
-    
-    coingecko_id = coingecko_coin_ids[coin_symbol]
-    url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days={days}'
-    
+# Fetch cryptocurrency data from CoinGecko API
+def fetch_coin_data(coin_symbol, days=365):
+    url = f'https://api.coingecko.com/api/v3/coins/{coin_symbol}/market_chart?vs_currency=usd&days={days}'
     response = requests.get(url)
     if response.status_code == 200:
         return response.json().get('prices', [])
-    else:
-        print(f"Error fetching data for {coin_symbol}: {response.status_code}")
-        return None
+    return []
 
-@app.route('/')
-def home():
-    return jsonify({"message": "Crypto Price Prediction API is running!"})
+# Fetch news articles from NewsAPI
+def fetch_crypto_news():
+    url = f"https://newsapi.org/v2/everything?q=cryptocurrency&apiKey={NEWS_API_KEY}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return [article['title'] for article in response.json().get('articles', [])]
+    return []
 
-@app.route('/predict', methods=['GET'])
-def predict_price():
-    coin = request.args.get("coin", "").lower()
-    
-    print(f"Received coin: '{coin}'")  # Debugging output
+# Analyze sentiment of news headlines using VADER
+def analyze_sentiment(texts):
+    analyzer = SentimentIntensityAnalyzer()
+    scores = [analyzer.polarity_scores(t)['compound'] for t in texts]
+    return np.mean(scores) if scores else 0
 
-    if coin not in coingecko_coin_ids:
-        return jsonify({"error": "Invalid coin. Available options: " + ", ".join(coingecko_coin_ids.keys())}), 400
-
-    model_path = os.path.join(MODEL_FOLDER, f"{coin}_crypto_price_model.h5")
-
-    if not os.path.exists(model_path):
-        return jsonify({"error": f"No trained model found for {coin}"}), 400
-
-    # Load the trained LSTM model
-    model = load_model(model_path)
-
-    # Fetch latest 120 days of coin data
-    data = fetch_coin_data(coin, days=120)
+# Function to predict the next 40 days of cryptocurrency price
+def make_40_days_prediction(coin_symbol, sentiment_score, lookback=60):
+    # Fetch cryptocurrency data (last 365 days)
+    data = fetch_coin_data(coin_symbol, days=365)
     if not data:
-        return jsonify({"error": f"Failed to fetch data for {coin}"}), 500
-
-    # Convert to DataFrame
+        return {"error": "Failed to fetch data for the coin."}
+    
     df = pd.DataFrame(data, columns=['timestamp', 'Close'])
     df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('Date', inplace=True)
+    
+    # Add sentiment score to the dataset
+    df['Sentiment'] = sentiment_score
 
-    # Preprocess the data
-    dataset = df[['Close']].values
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    # Prepare data for prediction
+    dataset = df[['Close', 'Sentiment']].values
+    scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(dataset)
 
-    # Prepare input sequence
-    lookback = 120  # Use 4 months of historical data
-    x_input = scaled_data[-lookback:].reshape(1, lookback, 1)
-
-    # Predict next 40 days
+    # Create sequences for training (ensure 3D shape)
+    x_input = scaled_data[-lookback:]
+    x_input = np.reshape(x_input, (1, lookback, 2))  # Shape: (1, lookback, 2)
+    
+    # Make predictions for the next 40 days
     future_predictions = []
     for _ in range(40):
-        pred = model.predict(x_input)
-        future_price = scaler.inverse_transform(pred)[0][0]
-        future_predictions.append(round(future_price, 2))
+        pred = models[coin_symbol].predict(x_input)[0][0]
+        future_predictions.append(float(pred))  # Convert to float
+        new_entry = np.array([[pred, sentiment_score]])
+        x_input = np.vstack((x_input[0][1:], new_entry))
+        x_input = np.reshape(x_input, (1, lookback, 2))  # Keep the shape consistent
 
-        # Update input sequence with new predicted value
-        pred = pred.reshape(1, 1, 1)  # Ensure pred matches LSTM input shape
-        x_input = np.append(x_input[:, 1:, :], pred, axis=1)
+    # Rescale the predictions to original price scale
+    future_scaled = np.hstack((np.array(future_predictions).reshape(-1, 1), np.zeros_like(np.array(future_predictions).reshape(-1, 1))))
+    future_prices = scaler.inverse_transform(future_scaled)[:, 0]
+
+    # Convert future prices to float and round
+    future_prices = [round(float(price), 2) for price in future_prices]
+
+    # Generate future dates
+    future_dates = pd.date_range(start=df.index[-1] + timedelta(days=1), periods=40)
+
+    # Return the results
+    return {
+        "future_dates": [date.strftime('%Y-%m-%d') for date in future_dates],
+        "predictions": future_prices  # Return the predictions as a list of floats
+    }
 
 
-    return jsonify({
-        "coin": coingecko_coin_ids[coin],
-        "predicted_prices": [float(pred) for pred in future_predictions]  # Convert float32 to Python float
-    })
+# Route to predict cryptocurrency prices for the next 40 days
+@app.route('/predict', methods=['GET'])
+def predict():
+    coin_symbol = request.args.get('coin_symbol', type=str).lower()
+    if coin_symbol not in models:
+        return jsonify({"error": "Invalid coin symbol. Available coins: bitcoin, binancecoin, ethereum, solana."})
 
+    # Fetch the latest news and analyze sentiment
+    news_headlines = fetch_crypto_news()
+    sentiment_score = analyze_sentiment(news_headlines)
+
+    # Predict the next 40 days
+    prediction_result = make_40_days_prediction(coin_symbol, sentiment_score)
+    
+    return jsonify(prediction_result)
 
 
 @app.route('/signup', methods=['POST'])

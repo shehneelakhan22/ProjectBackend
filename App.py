@@ -41,6 +41,7 @@ selectedtime_collection = mongo.db.timeFrame
 alerts_collection = mongo.db.alerts
 
 
+
 # Load pre-trained models
 model_directory = "trainedmodels"
 models = {
@@ -61,9 +62,10 @@ def fetch_coin_data(coin_symbol, days=365):
         return response.json().get('prices', [])
     return []
 
-# Fetch news articles from NewsAPI
+# Fetch news articles relevant to the entire crypto market (macro-level)
 def fetch_crypto_news():
-    url = f"https://newsapi.org/v2/everything?q=cryptocurrency&apiKey={NEWS_API_KEY}"
+    query = "cryptocurrency OR bitcoin OR ethereum OR crypto regulation OR adoption OR crash OR ETF OR market"
+    url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
     response = requests.get(url)
     if response.status_code == 200:
         return [article['title'] for article in response.json().get('articles', [])]
@@ -123,6 +125,14 @@ def make_40_days_prediction(coin_symbol, sentiment_score, lookback=60):
         "predictions": future_prices  # Return the predictions as a list of floats
     }
 
+# Route to fetch latest market-wide cryptocurrency news
+@app.route('/news', methods=['GET'])
+def get_crypto_news():
+    news_headlines = fetch_crypto_news()
+    if news_headlines:
+        return jsonify({"headlines": news_headlines})
+    else:
+        return jsonify({"error": "Failed to fetch news."}), 500
 
 # Route to predict cryptocurrency prices for the next 40 days
 @app.route('/predict', methods=['GET'])
@@ -131,7 +141,7 @@ def predict():
     if coin_symbol not in models:
         return jsonify({"error": "Invalid coin symbol. Available coins: bitcoin, binancecoin, ethereum, solana."})
 
-    # Fetch the latest news and analyze sentiment
+    # Fetch market-wide news and analyze sentiment
     news_headlines = fetch_crypto_news()
     sentiment_score = analyze_sentiment(news_headlines)
 

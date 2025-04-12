@@ -8,15 +8,15 @@ from get_RSI import fetch_RSI
 import time
 import yfinance as yf
 import os
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit # type: ignore
 from threading import Thread
 import numpy as np  
 import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model # type: ignore
 from datetime import datetime, timedelta
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer # type: ignore
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import io,base64
@@ -137,7 +137,7 @@ def get_crypto_news():
 # Route to predict cryptocurrency prices for the next 40 days
 @app.route('/predict', methods=['GET'])
 def predict():
-    coin_symbol = request.args.get('coin_symbol', type=str).lower()
+    coin_symbol = request.args.get('coin', type=str).lower()
     if coin_symbol not in models:
         return jsonify({"error": "Invalid coin symbol. Available coins: bitcoin, binancecoin, ethereum, solana."})
 

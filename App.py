@@ -20,12 +20,17 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer # type: ign
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 from datetime import datetime
+from flask import Flask, request, jsonify
+from threading import Thread
+from flask_socketio import SocketIO, emit
+
 
 
 MODEL_FOLDER = "model"
 
 
 app = Flask(__name__)
+socketio = SocketIO(app)
 app.config["MONGO_URI"] = "mongodb://localhost:27017/mydatabase"
 app.config['SECRET_KEY'] = 'e3c5f6a68e1c4529e929ee8b98207ac9'
 mongo = PyMongo(app)
@@ -39,80 +44,174 @@ rsi_collection = mongo.db.rsi
 selectedtime_collection = mongo.db.timeFrame
 wallets_collection = mongo.db.wallets
 
-
-
-
 ############################################################################################
 
-@app.route('/update_wallet', methods=['POST'])
-def update_wallet():
-    if 'username' not in session:
-        return jsonify({'error': 'User not authenticated'}), 401
+
+api_key = "181c06f3dee04b3aaa990d28aee32414"
+
+supported_coins = {
+    "1": "BTC/USD",
+    "2": "ETH/USD",
+    "3": "BNB/USD",
+    "4": "SOL/USD"
+}
+
+supported_intervals = {
+    "1": "1min",
+    "2": "5min",
+    "3": "15min"
+}
+
+# Global state variables
+bot_thread = None
+stop_flag = False
+trades = []
+portfolio_value = 0
+
+def fetch_latest_data(symbol, interval="1min", outputsize=100):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "apikey": api_key,
+        "outputsize": outputsize,
+        "format": "JSON"
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    if "values" not in data:
+        raise Exception(f"Error fetching data: {data}")
+    df = pd.DataFrame(data["values"])
+    df.rename(columns={"datetime": "date"}, inplace=True)
+    df["date"] = pd.to_datetime(df["date"])
+    df.set_index("date", inplace=True)
+    df = df.astype(float).sort_index()
+    return df
+
+def calculate_indicators(df):
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+    sma = df["close"].rolling(window=20).mean()
+    std = df["close"].rolling(window=20).std()
+    df["bb_upper"] = sma + 2 * std
+    df["bb_lower"] = sma - 2 * std
+    return df
+
+def trading_bot(symbol, interval, investment):
+    global stop_flag, trades, portfolio_value
+    in_position = False
+    buy_price = 0
+    portfolio_value = investment
+    trades.clear()
+    stop_flag = False
+
+    try:
+        while not stop_flag:
+            df = fetch_latest_data(symbol, interval)
+            df = calculate_indicators(df)
+            latest = df.iloc[-1]
+            rsi = latest["rsi"]
+            price = latest["close"]
+            bb_upper = latest["bb_upper"]
+            bb_lower = latest["bb_lower"]
+            time_stamp = latest.name.strftime('%Y-%m-%d %H:%M:%S')
+
+            if not in_position and 20 < rsi < 35 and price < bb_lower:
+                in_position = True
+                buy_price = price
+                trades.append({"type": "BUY", "price": price, "time": time_stamp})
+
+            elif in_position and 60 < rsi < 70 and price > bb_upper:
+                sell_price = price
+                profit = (sell_price - buy_price) * (portfolio_value / buy_price)
+                portfolio_value += profit
+                trades.append({"type": "SELL", "price": sell_price, "time": time_stamp, "profit": profit})
+                in_position = False
+
+            time.sleep(60)
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+    if in_position:
+        # Force sell on stop
+        df = fetch_latest_data(symbol, interval)
+        latest = df.iloc[-1]
+        sell_price = latest["close"]
+        time_stamp = latest.name.strftime('%Y-%m-%d %H:%M:%S')
+        profit = (sell_price - buy_price) * (portfolio_value / buy_price)
+        portfolio_value += profit
+        trades.append({"type": "SELL", "price": sell_price, "time": time_stamp, "profit": profit})
+
+@app.route('/start_trading', methods=['POST'])
+def start_trading():
+    global bot_thread
 
     data = request.get_json()
-    username = session['username']
+    coin = data.get("coin")
+    timeframe = data.get("timeframe")
+    investment = float(data.get("investment", 1000))
 
-    investmentAmount = data.get('amount')                # Investment when user starts the bot
-    print(f"Investment Amount: {investmentAmount}")
+    if coin not in supported_coins or timeframe not in supported_intervals:
+        return jsonify({"error": "Invalid coin or timeframe."}), 400
 
-    currentUpdatedBalance = data.get('currentBalance')   # Total amount when user stops the bot
+    symbol = supported_coins[coin]
+    interval = supported_intervals[timeframe]
 
-    # Validate inputs
-    if investmentAmount is None and currentUpdatedBalance is None:
-        return jsonify({'error': 'Provide either "amount" or "currentBalance"'}), 400
+    # Fetch current values for snapshot
+    try:
+        df = fetch_latest_data(symbol, interval)
+        df = calculate_indicators(df)
+        latest = df.iloc[-1]
 
-    # Fetch current wallet
-    wallet = wallets_collection.find_one({'username': username})
-    current_amount = float(wallet.get('balance', 0)) if wallet else 0
+        snapshot = {
+            "symbol": symbol,
+            "interval": interval,
+            "current_price": round(latest["close"], 4),
+            "rsi": round(latest["rsi"], 2),
+            "bb_upper": round(latest["bb_upper"], 4),
+            "bb_lower": round(latest["bb_lower"], 4),
+            "timestamp": latest.name.strftime('%Y-%m-%d %H:%M:%S')
+        }
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if currentUpdatedBalance is not None:
-        if not isinstance(currentUpdatedBalance, (int, float)):
-            return jsonify({'error': '"currentBalance" must be a number'}), 400
-        updated_balance = currentUpdatedBalance
+    # Start bot
+    bot_thread = Thread(target=trading_bot, args=(symbol, interval, investment))
+    bot_thread.start()
 
-    # If 'amount' is provided, add to the current balance
-    elif investmentAmount is not None:
-        if not isinstance(investmentAmount, (int, float)):
-            return jsonify({'error': '"amount" must be a number'}), 400
-        updated_balance = current_amount + investmentAmount
+    return jsonify({
+        "message": f"Bot started for {symbol} with {interval} timeframe.",
+        "latest_data": snapshot
+    }), 200
 
-    # Format balance with thousand separator
-    formatted_balance = f"{updated_balance:,.2f}"  # e.g., 1000 -> '1,000.00'
+@app.route('/stop_trading', methods=['GET'])
+def stop_trading():
+    global stop_flag, bot_thread
 
-    wallets_collection.update_one(
-        {'username': username},
-        {
-            '$set': {
-                'balance': formatted_balance,
-                'currency': 'USD',
-                'last_updated': datetime.utcnow()
-            }
-        },
-        upsert=True
-    )
+    stop_flag = True
+    if bot_thread and bot_thread.is_alive():
+        bot_thread.join()
 
-    return jsonify({'message': f'Wallet updated successfully. New balance: ${updated_balance:.2f}'}), 200
+    total_profit = sum(t.get("profit", 0) for t in trades if t["type"] == "SELL")
+    return jsonify({
+        "message": "Bot stopped.",
+        "final_portfolio_value": round(portfolio_value, 2),
+        "total_profit": round(total_profit, 2),
+        "total_trades": len(trades),
+        "trades": trades
+    }), 200
 
-
-# Get wallet amount
-@app.route('/get_balance', methods=['GET'])
-def get_balance():
-    if 'username' not in session:
-        return jsonify({'error': 'User not authenticated'}), 401
-
-    username = session['username']
-    wallet = wallets_collection.find_one({'username': username})
-
-    if not wallet:
-        return jsonify({'error': 'Wallet not found'}), 404
-
-    # Get the balance from the wallet and ensure it's a string with a thousand separator
-    balance = wallet.get('balance', 0)
-    formatted_balance = "{:,.2f}".format(balance)  # This will add the thousand separator
-
-    return jsonify({'balance': formatted_balance}), 200
-
-
+@app.route('/get_trades', methods=['GET'])
+def get_trades():
+    return jsonify({
+        "trades": trades,
+        "total_profit": round(sum(t.get("profit", 0) for t in trades if t["type"] == "SELL"), 2),
+        "final_portfolio_value": round(portfolio_value, 2)
+    }), 200
 ############################################################################################
 
 

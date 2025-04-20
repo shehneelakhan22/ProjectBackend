@@ -19,8 +19,7 @@ from datetime import datetime, timedelta
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer # type: ignore
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-import io,base64
-
+from datetime import datetime
 
 
 MODEL_FOLDER = "model"
@@ -38,7 +37,83 @@ candle_chart_prices_collection = mongo.db.candle_chart_prices
 bbands_collection = mongo.db.bbands
 rsi_collection = mongo.db.rsi
 selectedtime_collection = mongo.db.timeFrame
-alerts_collection = mongo.db.alerts
+wallets_collection = mongo.db.wallets
+
+
+
+
+############################################################################################
+
+@app.route('/update_wallet', methods=['POST'])
+def update_wallet():
+    if 'username' not in session:
+        return jsonify({'error': 'User not authenticated'}), 401
+
+    data = request.get_json()
+    username = session['username']
+
+    investmentAmount = data.get('amount')                # Investment when user starts the bot
+    print(f"Investment Amount: {investmentAmount}")
+
+    currentUpdatedBalance = data.get('currentBalance')   # Total amount when user stops the bot
+
+    # Validate inputs
+    if investmentAmount is None and currentUpdatedBalance is None:
+        return jsonify({'error': 'Provide either "amount" or "currentBalance"'}), 400
+
+    # Fetch current wallet
+    wallet = wallets_collection.find_one({'username': username})
+    current_amount = float(wallet.get('balance', 0)) if wallet else 0
+
+    if currentUpdatedBalance is not None:
+        if not isinstance(currentUpdatedBalance, (int, float)):
+            return jsonify({'error': '"currentBalance" must be a number'}), 400
+        updated_balance = currentUpdatedBalance
+
+    # If 'amount' is provided, add to the current balance
+    elif investmentAmount is not None:
+        if not isinstance(investmentAmount, (int, float)):
+            return jsonify({'error': '"amount" must be a number'}), 400
+        updated_balance = current_amount + investmentAmount
+
+    # Format balance with thousand separator
+    formatted_balance = f"{updated_balance:,.2f}"  # e.g., 1000 -> '1,000.00'
+
+    wallets_collection.update_one(
+        {'username': username},
+        {
+            '$set': {
+                'balance': formatted_balance,
+                'currency': 'USD',
+                'last_updated': datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+
+    return jsonify({'message': f'Wallet updated successfully. New balance: ${updated_balance:.2f}'}), 200
+
+
+# Get wallet amount
+@app.route('/get_balance', methods=['GET'])
+def get_balance():
+    if 'username' not in session:
+        return jsonify({'error': 'User not authenticated'}), 401
+
+    username = session['username']
+    wallet = wallets_collection.find_one({'username': username})
+
+    if not wallet:
+        return jsonify({'error': 'Wallet not found'}), 404
+
+    # Get the balance from the wallet and ensure it's a string with a thousand separator
+    balance = wallet.get('balance', 0)
+    formatted_balance = "{:,.2f}".format(balance)  # This will add the thousand separator
+
+    return jsonify({'balance': formatted_balance}), 200
+
+
+############################################################################################
 
 
 
@@ -170,14 +245,24 @@ def signup():
 
     if len(password) < 8:
         return jsonify({'error': 'Password should be at least 8 characters long'}), 400
+    
+    user_result = users_collection.insert_one({
+    'username': username,
+    'email': email,
+    'password': password
+       })
 
-    users_collection.insert_one({
-        'username': username,
-        'email': email,
-        'password': password
+    user_id = str(user_result.inserted_id)
+
+    wallets_collection.insert_one({
+    'user_id': user_id,
+    'username': username,
+    'balance': 0.0,  # USD
+    'created_at': datetime.utcnow()
     })
 
-    return jsonify({'message': 'User signed up successfully'}), 201
+    return jsonify({'message': 'User signed up successfully and wallet created'}), 201
+
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -442,103 +527,6 @@ def save_time():
     selectedtime_collection.insert_one(new_time)
 
     return jsonify({'message': 'Time frame saved successfully for the selected coin'}), 201
-
-
-@app.route('/generate_alerts', methods=['POST'])
-def generate_alerts():
-    # Retrieve user information from session
-    username = session.get('username')
-    email = session.get('email')
-    
-    if not username or not email:
-        return jsonify({'error': 'User not authenticated'}), 401
-    
-    data = request.get_json()
-    timeFrame = data.get('selectedTime')
-    symbol = data.get('selectedValue')
-
-    if not timeFrame or not symbol:
-        return jsonify({'error': 'Time interval and symbol are required'}), 400
-
-    try:
-        time_interval_minutes = int(timeFrame.rstrip('m'))
-        start_time = datetime.utcnow()
-        end_time = start_time + timedelta(minutes=time_interval_minutes)
-    except ValueError:
-        return jsonify({'error': 'Invalid time interval provided'}), 400
-
-    while datetime.utcnow() < end_time:
-        rsi_value = fetch_RSI(symbol, timeFrame)
-        
-        if rsi_value is None:
-            return jsonify({'error': 'RSI value not found or error fetching data'}), 500
-
-        alert_message = None
-        if 25 < rsi_value < 35:
-            alert_message = 'Buy the coin'
-        elif 40 < rsi_value < 75:
-            alert_message = 'Sell the coin'
-
-        if alert_message:
-            alert_data = {
-                "timeFrame": timeFrame,
-                "start_time": start_time,
-                "end_time": end_time,
-                "symbol": symbol,
-                "created_at": datetime.utcnow(),
-                "rsi_value": rsi_value,
-                "message": alert_message,
-                "username": username, 
-                "email": email   
-            }
-            alerts_collection.insert_one(alert_data)
-        
-        time.sleep(15)
-
-    return jsonify({'message': 'Alert generation process completed.'}), 201
-
-@app.route('/get_alerts', methods=['GET'])
-def get_alerts():
-    try:
-        timeFrame = request.args.get('selectedTime')
-        symbol = request.args.get('selectedValue')
-
-        if not timeFrame or not symbol:
-            return jsonify({'error': 'Time interval and symbol are required'}), 400
-
-        try:
-            time_interval_minutes = int(timeFrame.rstrip('m')) # Extract the number of minutes from the timeFrame string
-            current_time = datetime.utcnow()
-            start_time = current_time - timedelta(minutes=time_interval_minutes) # Calculate the start time by subtracting the timeFrame (interval) from the current time
-        except ValueError:
-            return jsonify({'error': 'Invalid time interval provided'}), 400
-
-        alerts = alerts_collection.find(
-            {
-                'symbol': symbol,         # Match the symbol
-                'created_at': {           # Find alerts within the specified time range
-                    '$gte': start_time,   # Greater than or equal to start_time
-                    '$lte': current_time  # Less than or equal to end_time
-                }
-            },
-            {
-                'symbol': 1,       
-                'timeFrame': 1,
-                'message': 1,
-                'rsi_value': 1,
-                'username': 1,
-                'email': 1,
-                'created_at' : 1,
-                '_id': 0          
-            }
-        )
-
-        alerts_list = list(alerts)   # Convert the result to a list
-        
-        return jsonify({'alerts': alerts_list}), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
    
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

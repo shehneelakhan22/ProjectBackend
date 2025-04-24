@@ -15,14 +15,9 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model # type: ignore
-from datetime import datetime, timedelta
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer # type: ignore
-from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-from datetime import datetime
-from flask import Flask, request, jsonify
-from threading import Thread
-from flask_socketio import SocketIO, emit
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 
@@ -36,6 +31,9 @@ app.config['SECRET_KEY'] = 'e3c5f6a68e1c4529e929ee8b98207ac9'
 mongo = PyMongo(app)
 CORS(app)  # Enable CORS for all routes
 
+
+##################################----Database Collections----##################################
+
 users_collection = mongo.db.users
 prices_collection = mongo.db.prices
 candle_chart_prices_collection = mongo.db.candle_chart_prices
@@ -44,22 +42,23 @@ rsi_collection = mongo.db.rsi
 selectedtime_collection = mongo.db.timeFrame
 wallets_collection = mongo.db.wallets
 
-############################################################################################
 
+
+##################################----Bot Mangement----##################################
 
 api_key = "181c06f3dee04b3aaa990d28aee32414"
 
 supported_coins = {
-    "1": "BTC/USD",
-    "2": "ETH/USD",
-    "3": "BNB/USD",
-    "4": "SOL/USD"
+    "BTC": "BTC/USD",
+    "ETH": "ETH/USD",
+    "BNB": "BNB/USD",
+    "SOL": "SOL/USD"
 }
 
 supported_intervals = {
-    "1": "1min",
-    "2": "5min",
-    "3": "15min"
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min"
 }
 
 # Global state variables
@@ -100,11 +99,11 @@ def calculate_indicators(df):
     df["bb_lower"] = sma - 2 * std
     return df
 
-def trading_bot(symbol, interval, investment):
+def trading_bot(symbol, interval, balance):
     global stop_flag, trades, portfolio_value
     in_position = False
     buy_price = 0
-    portfolio_value = investment
+    portfolio_value = balance
     trades.clear()
     stop_flag = False
 
@@ -146,14 +145,14 @@ def trading_bot(symbol, interval, investment):
         portfolio_value += profit
         trades.append({"type": "SELL", "price": sell_price, "time": time_stamp, "profit": profit})
 
-@app.route('/start_trading', methods=['POST'])
+@app.route('/start_Bot', methods=['POST'])
 def start_trading():
     global bot_thread
 
     data = request.get_json()
     coin = data.get("coin")
     timeframe = data.get("timeframe")
-    investment = float(data.get("investment", 1000))
+    balance = float(data.get("balance", 1000))
 
     if coin not in supported_coins or timeframe not in supported_intervals:
         return jsonify({"error": "Invalid coin or timeframe."}), 400
@@ -180,7 +179,7 @@ def start_trading():
         return jsonify({"error": str(e)}), 500
 
     # Start bot
-    bot_thread = Thread(target=trading_bot, args=(symbol, interval, investment))
+    bot_thread = Thread(target=trading_bot, args=(symbol, interval, balance))
     bot_thread.start()
 
     return jsonify({
@@ -188,7 +187,7 @@ def start_trading():
         "latest_data": snapshot
     }), 200
 
-@app.route('/stop_trading', methods=['GET'])
+@app.route('/stop_Bot', methods=['GET'])
 def stop_trading():
     global stop_flag, bot_thread
 
@@ -210,12 +209,88 @@ def get_trades():
     return jsonify({
         "trades": trades,
         "total_profit": round(sum(t.get("profit", 0) for t in trades if t["type"] == "SELL"), 2),
-        "final_portfolio_value": round(portfolio_value, 2)
+        # "final_portfolio_value": round(portfolio_value, 2)
+        "final_portfolio_value": round(float(portfolio_value or 0), 2)
+
     }), 200
-############################################################################################
+
+
+#########################################----Wallet Managemnt----#########################################
+
+@app.route('/update_wallet', methods=['POST'])
+def update_wallet():
+    if 'username' not in session:
+        return jsonify({'error': 'User not authenticated'}), 401
+
+    data = request.get_json()
+    username = session['username']
+
+    print("Received amount:", data.get('amount'))
+    print("User session username:", session.get('username'))
+
+    investmentAmount = data.get('amount')          # Investment when user starts the bot
+    currentUpdatedBalance = data.get('currentBalance')   # Total amount when user stops the bot
+
+    # Validate inputs
+    if investmentAmount is None and currentUpdatedBalance is None:
+        return jsonify({'error': 'Provide either "amount" or "currentBalance"'}), 400
+
+    # Fetch current wallet
+    wallet = wallets_collection.find_one({'username': username})
+    raw_balance = wallet.get('balance', 0) if wallet else 0
+    try:
+       current_amount = float(str(raw_balance).replace(',', ''))
+    except ValueError:
+       return jsonify({'error': 'Stored balance is invalid'}), 500
 
 
 
+    if currentUpdatedBalance is not None:
+        if not isinstance(currentUpdatedBalance, (int, float)):
+            return jsonify({'error': '"currentBalance" must be a number'}), 400
+        updated_balance = currentUpdatedBalance
+
+    # If 'amount' is provided, add to the current balance
+    elif investmentAmount is not None:
+        if not isinstance(investmentAmount, (int, float)):
+            return jsonify({'error': '"amount" must be a number'}), 400
+        updated_balance = current_amount + investmentAmount
+
+    wallets_collection.update_one(
+        {'username': username},
+        {
+            '$set': {
+                'balance': updated_balance,
+                'currency': 'USD',
+                'last_updated': datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+
+    formatted_balance = f"{updated_balance:,.2f}"
+    return jsonify({'message': f'Wallet updated successfully. New balance: ${formatted_balance}'}), 200
+
+
+
+@app.route('/get_balance', methods=['GET'])
+def get_balance():
+    if 'username' not in session:
+        return jsonify({'error': 'User not authenticated'}), 401
+
+    username = session['username']
+    wallet = wallets_collection.find_one({'username': username})
+
+    if not wallet:
+        return jsonify({'error': 'Wallet not found'}), 404
+
+    balance = wallet.get('balance', 0)
+    return jsonify({'balance': balance}), 200
+
+
+##################################----News and Prediction Management----##################################
+
+ 
 # Load pre-trained models
 model_directory = "trainedmodels"
 models = {
@@ -325,6 +400,8 @@ def predict():
     return jsonify(prediction_result)
 
 
+##################################----User Managemnet----##################################
+
 @app.route('/signup', methods=['POST'])
 def signup():
     data = request.get_json()
@@ -333,18 +410,12 @@ def signup():
     email = data.get('email')
     password = data.get('password')
 
-    if not username or not email or not password:
-        return jsonify({'error': 'Provide all credentials'}), 400
-
     if users_collection.find_one({'email': email}):
         return jsonify({'error': 'Email is already registered'}), 400
 
     if users_collection.find_one({'username': username}):
         return jsonify({'error': 'Username is already taken'}), 400
 
-    if len(password) < 8:
-        return jsonify({'error': 'Password should be at least 8 characters long'}), 400
-    
     user_result = users_collection.insert_one({
     'username': username,
     'email': email,
@@ -377,8 +448,11 @@ def login():
         '$or': [{'email': email_or_username}, {'username': email_or_username}]
     })
 
-    if not user or user['password'] != password:
-        return jsonify({'error': 'Invalid email/username or password'}), 400
+    if not user:
+        return jsonify({'error': 'Email/Username not found'}), 400
+    
+    if user['password'] != password:
+        return jsonify({'error': 'Incorrect password'}), 400
     
      # Set session data
     session['username'] = user['username']
@@ -439,6 +513,38 @@ def delete_account():
     return jsonify({'message': 'Account deleted successfully'}), 200
 
 
+@app.route('/changepassword', methods=['POST'])
+def change_password():
+    if 'email' not in session:
+        return jsonify({'error': 'Unauthorized. Please log in.'}), 401
+
+    data = request.get_json()
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
+
+    user_email = session['email']
+    user = users_collection.find_one({'email': user_email})
+    
+
+    if not user:
+        return jsonify({'error': 'User not found.'}), 404
+
+    #  Check plaintext password match
+    if user['password'] != current_password:
+        return jsonify({'error': 'Current password is incorrect.'}), 403
+
+    #  Update to new password (still plaintext)
+    users_collection.update_one(
+        {'email': user_email},
+        {'$set': {'password': new_password}}
+    )
+
+    return jsonify({'message': 'Password changed successfully!'}), 200
+
+
+
+
+##################################----Live Prices----##################################
 
 @app.route('/get_live_price', methods=['GET'])
 def get_live_price():
@@ -528,6 +634,9 @@ def get_candlestick_data():
     except Exception as e:
         # Handle any errors that occur during the API request
         return jsonify({'error': str(e)}), 500
+    
+
+##################################----Indicators Data----##################################
 
 @app.route('/get_bbands', methods=['GET'])
 def get_bbands():
@@ -591,41 +700,5 @@ def get_rsi():
     else:
         return jsonify({'error': 'RSI value not found or error fetching data'}), 500
 
-@app.route('/save_time', methods=['POST'])
-def save_time():
-     # Retrieve user information from session
-    username = session.get('username')
-    email = session.get('email')
-    
-    if not username or not email:
-        return jsonify({'error': 'User not authenticated'}), 401
-    
-    data = request.get_json()
-    timeFrame = data.get('selectedTime')
-    symbol = data.get('selectedValue')
-
-    if not timeFrame or not symbol:
-        return jsonify({'error': 'Time interval and symbol are required'}), 400
-
-    try:
-        time_interval_minutes = int(timeFrame.rstrip('m'))
-        start_time = datetime.utcnow()
-        end_time = start_time + timedelta(minutes=time_interval_minutes)
-    except ValueError:
-        return jsonify({'error': 'Invalid time interval provided'}), 400
-    
-    new_time = {
-        "timeFrame": timeFrame,
-        "symbol": symbol,
-        "start_time": start_time,
-        "end_time": end_time,
-        "created_at": start_time,
-        "username": username, 
-        "email": email      
-    }
-    selectedtime_collection.insert_one(new_time)
-
-    return jsonify({'message': 'Time frame saved successfully for the selected coin'}), 201
-   
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
